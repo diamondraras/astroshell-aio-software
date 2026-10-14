@@ -20,8 +20,6 @@ import threading
 import time
 from fractions import Fraction
 
-import numpy as np
-
 log = logging.getLogger(__name__)
 
 VID, PID = 0x1F3A, 0x0007
@@ -97,9 +95,10 @@ class H264Encoder:
                 last_err = e
         raise RuntimeError(f"no usable H.264 encoder: {last_err}")
 
-    def encode(self, rgba: np.ndarray) -> bytes:
+    def encode(self, bgra) -> bytes:
+        """bgra: numpy array H x W x 4 (the memory layout of QImage.Format_ARGB32)."""
         import av
-        frame = av.VideoFrame.from_ndarray(rgba, format="rgba").reformat(
+        frame = av.VideoFrame.from_ndarray(bgra, format="bgra").reformat(
             self.width, self.height, format="yuv420p")
         frame.pts = self._pts
         self._pts += 1
@@ -164,14 +163,21 @@ class DeviceManager(threading.Thread):
     """Owns connection, reply parsing, pending commands and the frame stream.
 
     Callbacks (called from worker threads; marshal to the GUI thread yourself):
-      on_state(connected: bool), on_version(text: str), on_firmware(done: bool, ok: bool, msg: str)
+      on_state(connected: bool), on_version(text: str), on_firmware(done: bool, ok: bool, msg: str),
+      on_status(text: str)  human-readable connection status, emitted when it changes
     """
 
-    def __init__(self, on_state=None, on_version=None, on_firmware=None):
+    STATUS_SEARCHING = "Searching for the display…"
+    STATUS_BUSY = "Display found but in use by another program (another SmartMonitor app?)"
+    STATUS_CONNECTED = "Connected"
+
+    def __init__(self, on_state=None, on_version=None, on_firmware=None, on_status=None):
         super().__init__(name="Transport", daemon=True)
         self.on_state = on_state or (lambda c: None)
         self.on_version = on_version or (lambda v: None)
         self.on_firmware = on_firmware or (lambda d, ok, m: None)
+        self.on_status = on_status or (lambda s: None)
+        self.status = ""
         self.device: Device | None = None
         self.version = ""
         self.old_firmware = False
@@ -189,16 +195,16 @@ class DeviceManager(threading.Thread):
     def connected(self) -> bool:
         return self.device is not None
 
-    def submit_frame(self, rgba: np.ndarray):
-        """Queue a rendered RGBA frame (H x W x 4, uint8). Drops the oldest when full."""
+    def submit_frame(self, bgra):
+        """Queue a rendered frame (numpy H x W x 4, BGRA, uint8). Drops the oldest when full."""
         try:
-            self._frames.put_nowait(rgba)
+            self._frames.put_nowait(bgra)
         except queue.Full:
             try:
                 self._frames.get_nowait()
             except queue.Empty:
                 pass
-            self._frames.put_nowait(rgba)
+            self._frames.put_nowait(bgra)
 
     def set_brightness(self, percent: int):
         self._commands.put(brightness_packet(percent))
@@ -230,12 +236,12 @@ class DeviceManager(threading.Thread):
                 while not self._commands.empty():
                     self.device.write(self._commands.get_nowait())
                 try:
-                    rgba = self._frames.get(timeout=0.1)
+                    bgra = self._frames.get(timeout=0.1)
                 except queue.Empty:
                     continue
                 if self._encoder is None:
                     self._encoder = H264Encoder(self.width, self.height)
-                nal = self._encoder.encode(rgba)
+                nal = self._encoder.encode(bgra)
                 if nal:
                     self.device.write(packet(CMD_FRAME, nal))
             except Exception as e:
@@ -243,17 +249,26 @@ class DeviceManager(threading.Thread):
                 self._close()
         self._close()
 
+    def _set_status(self, text: str):
+        if text != self.status:
+            self.status = text
+            log.info("device: %s", text)
+            self.on_status(text)
+
     def _try_open(self) -> bool:
         try:
             dev = find_device()
             if dev is None:
+                self._set_status(self.STATUS_SEARCHING)
                 return False
             self.device = Device(dev)
         except Exception as e:
             log.debug("Could not open device: %s", e)
             self.device = None
+            busy = getattr(e, "errno", None) in (13, 16) or "access" in str(e).lower() or "busy" in str(e).lower()
+            self._set_status(self.STATUS_BUSY if busy else f"Display found but cannot be opened: {e}")
             return False
-        log.info("Device open")
+        self._set_status(self.STATUS_CONNECTED)
         self._reader = threading.Thread(target=self._read_loop, name="UsbReader", daemon=True)
         self._reader.start()
         self.device.write(packet(CMD_HELLO, b"\x01"))

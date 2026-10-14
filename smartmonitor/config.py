@@ -22,7 +22,13 @@ DEFAULTS = {
     "temp/uint": 0,          # 0 = Celsius, 1 = Fahrenheit (key spelled "uint" in the original)
     "autoRun/state": True,
     "theme/name": "T00",
+    # additions of this rebuild (not in the original baseInfo.cfg)
+    "display/mode": 1,       # 0 = theme, 1 = system dashboard, 2 = screen capture
+    "dashboard/hour24": True,
+    "ui/trayHintShown": False,
 }
+
+MODE_THEME, MODE_DASHBOARD, MODE_CAPTURE = 0, 1, 2
 
 LANGUAGES = ["English", "Chinese", "French", "Japanese", "Korean", "Portuguese"]
 

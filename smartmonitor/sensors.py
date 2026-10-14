@@ -21,6 +21,7 @@ import struct
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 
 import psutil
@@ -166,22 +167,137 @@ def _read_amd_sysfs(card: str) -> dict[str, float]:
     return out
 
 
+# --------------------------------------------------------------------------- LibreHardwareMonitor
+class _LhmHttp:
+    """Optional CPU temperature source: LibreHardwareMonitor's "Remote Web Server" (localhost only).
+
+    Used on Windows when HWiNFO shared memory is unavailable. The JSON tree is walked generically:
+    a node whose Value ends with "°C" below a CPU node (ImageURL/SensorId mentioning "cpu").
+    """
+
+    URL = "http://127.0.0.1:8085/data.json"
+    PREFERRED = ("CPU Package", "Core (Tctl/Tdie)", "CPU (Tctl/Tdie)", "Core Average", "CPU Core")
+
+    def __init__(self):
+        self._retry_at = 0.0
+
+    def cpu_temp(self):
+        if sys.platform != "win32" or time.monotonic() < self._retry_at:
+            return None
+        import json
+        import urllib.request
+        try:
+            with urllib.request.urlopen(self.URL, timeout=0.3) as r:
+                tree = json.load(r)
+        except Exception:
+            self._retry_at = time.monotonic() + 30.0  # not running: check again later
+            return None
+        return self.pick_cpu_temp(tree)
+
+    @classmethod
+    def pick_cpu_temp(cls, tree):
+        found: list[tuple[str, float]] = []
+
+        def walk(node, in_cpu):
+            tag = f"{node.get('ImageURL', '')} {node.get('SensorId', '')}".lower()
+            in_cpu = in_cpu or "cpu" in tag
+            val = str(node.get("Value", ""))
+            if in_cpu and val.endswith("°C"):
+                try:
+                    found.append((str(node.get("Text", "")), float(val[:-2].strip().replace(",", "."))))
+                except ValueError:
+                    pass
+            for c in node.get("Children", []) or []:
+                walk(c, in_cpu)
+
+        walk(tree, False)
+        for name in cls.PREFERRED:
+            for text, v in found:
+                if text.startswith(name):
+                    return v
+        return found[0][1] if found else None
+
+
+# --------------------------------------------------------------------------- network helpers
+_VIRTUAL_NIC = ("loopback", "teredo", "isatap", "vmware", "virtualbox", "vethernet", "docker", "bluetooth")
+
+
+def internet_interface() -> str | None:
+    """Name of the interface holding the default route, or None when there is no route.
+
+    A UDP "connect" only asks the OS for a route; no packet is sent.
+    """
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("1.1.1.1", 80))
+            local_ip = s.getsockname()[0]
+    except OSError:
+        return None
+    for nic, addrs in psutil.net_if_addrs().items():
+        if any(a.address == local_ip for a in addrs):
+            return nic
+    return None
+
+
+class _Connectivity(threading.Thread):
+    """Checks real internet reachability with a TCP handshake (no payload sent)."""
+
+    TARGETS = (("1.1.1.1", 443), ("8.8.8.8", 53), ("9.9.9.9", 443))
+
+    def __init__(self, stop: threading.Event, period: float = 10.0):
+        super().__init__(name="Connectivity", daemon=True)
+        self._stop_evt, self.period = stop, period
+        self.online: bool | None = None  # None = not checked yet
+
+    def check(self) -> bool:
+        import socket
+        if internet_interface() is None:
+            return False
+        for host, port in self.TARGETS:
+            try:
+                socket.create_connection((host, port), timeout=2.0).close()
+                return True
+            except OSError:
+                continue
+        return False
+
+    def run(self):
+        while not self._stop_evt.is_set():
+            self.online = self.check()
+            self._stop_evt.wait(self.period if self.online else 3.0)
+
+
 # --------------------------------------------------------------------------- manager
+HISTORY_SECONDS = 60
+
+
 class SensorManager:
-    """Polls all sensors on a background thread (the original used DispSensorManager::run)."""
+    """Polls all sensors on a background thread (the original used DispSensorManager::run).
+
+    Besides the instantaneous values it keeps one sample per second for the last minute
+    (history()), and exposes uptime, internet state and data used since boot.
+    """
 
     def __init__(self, interval: float = 1.0):
         self.interval = interval
         self._values: dict[str, float] = {}
+        self._history: dict[str, deque] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._hwinfo = _HwinfoShm()
-        self._gpu = _Gpu()
+        self._hwinfo_retry = 0.0
+        self._lhm = _LhmHttp()
+        self._gpu: _Gpu | None = None   # created on the sensor thread (NVML init is slow)
         self._net_prev = None
-        self._nic: str | None = None    # None = all interfaces
+        self._nic: str | None = None    # None = automatic (interface holding the default route)
+        self._auto_nic: str | None = None
+        self._auto_nic_at = 0.0
         self._disk: str | None = None   # mount point; None = system drive
-        psutil.cpu_percent(None)
+        self._boot = psutil.boot_time()
+        self._conn = _Connectivity(self._stop)
         self._thread = threading.Thread(target=self._run, name="SensorManager", daemon=True)
+        self.version = 0                # incremented after every poll
 
     # configuration ----------------------------------------------------------
     @staticmethod
@@ -202,6 +318,7 @@ class SensorManager:
     # lifecycle ----------------------------------------------------------------
     def start(self):
         self._thread.start()
+        self._conn.start()
 
     def stop(self):
         self._stop.set()
@@ -214,15 +331,51 @@ class SensorManager:
         with self._lock:
             return self._values.get(key)
 
+    def history(self, key: str) -> list:
+        """Last HISTORY_SECONDS samples, oldest first; None where the sensor had no value."""
+        with self._lock:
+            h = self._history.get(key)
+            return list(h) if h else []
+
+    @property
+    def online(self) -> bool | None:
+        return self._conn.online
+
+    @property
+    def interface(self) -> str | None:
+        return self._nic or self._auto_nic
+
+    def uptime(self) -> float:
+        return max(0.0, time.time() - self._boot)
+
     def _run(self):
+        psutil.cpu_percent(None)
+        if self._gpu is None:
+            self._gpu = _Gpu()
         while not self._stop.is_set():
             try:
-                vals = self._poll()
-                with self._lock:
-                    self._values = vals
+                self._store(self._poll())
             except Exception:
                 pass
             self._stop.wait(self.interval)
+
+    def _store(self, vals: dict[str, float]):
+        with self._lock:
+            self._values = vals
+            for k in set(vals) | set(self._history):
+                self._history.setdefault(k, deque(maxlen=HISTORY_SECONDS)).append(vals.get(k))
+            self.version += 1
+
+    def _active_nic(self) -> str | None:
+        if self._nic:
+            return self._nic
+        now = time.monotonic()
+        if now >= self._auto_nic_at:
+            nic = internet_interface()
+            if nic != self._auto_nic:
+                self._net_prev = None
+            self._auto_nic, self._auto_nic_at = nic, now + 5.0
+        return self._auto_nic
 
     def _poll(self) -> dict[str, float]:
         v: dict[str, float] = {}
@@ -246,10 +399,16 @@ class SensorManager:
                 v["cpu_temp"] = (pkg or entries)[0].current
                 break
 
-        v.update(self._gpu.read())
+        if self._gpu is not None:
+            v.update(self._gpu.read())
 
-        # HWiNFO (Windows): same labels as the original app; overrides missing values only
-        hw = self._hwinfo.read()
+        # HWiNFO (Windows): same labels as the original app; retried every 10 s when absent
+        now = time.monotonic()
+        hw = {}
+        if sys.platform == "win32" and now >= self._hwinfo_retry:
+            hw = self._hwinfo.read()
+            if not hw:
+                self._hwinfo_retry = now + 10.0
         if hw:
             picks = {
                 "cpu_temp": ("CPU [#0]", ["CPU Package", "CPU Die", "CPU (Tctl/Tdie)"]),
@@ -264,22 +423,34 @@ class SensorManager:
                     r = _hw_pick(hw, prefix, labels)
                     if r is not None:
                         v[key] = r
+        if "cpu_temp" not in v:
+            t = self._lhm.cpu_temp()
+            if t is not None:
+                v["cpu_temp"] = t
 
-        # Network throughput (KB/s)
-        now = time.monotonic()
+        # Network: throughput (KB/s) and bytes counted since the interface came up (normally boot)
         counters = psutil.net_io_counters(pernic=True)
-        if self._nic and self._nic in counters:
-            c = counters[self._nic]
+        nic = self._active_nic()
+        if nic and nic in counters:
+            c = counters[nic]
             sent, recv = c.bytes_sent, c.bytes_recv
+        elif nic is None and self._nic is None:
+            sent = recv = None  # no default route: offline
         else:
-            sent = sum(c.bytes_sent for c in counters.values())
-            recv = sum(c.bytes_recv for c in counters.values())
-        if self._net_prev:
-            t0, s0, r0 = self._net_prev
-            dt = max(now - t0, 1e-3)
-            v["net_up"] = (sent - s0) / dt / 1024.0
-            v["net_down"] = (recv - r0) / dt / 1024.0
-        self._net_prev = (now, sent, recv)
+            real = [c for n, c in counters.items() if n != "lo" and not n.lower().startswith(_VIRTUAL_NIC)]
+            sent = sum(c.bytes_sent for c in real)
+            recv = sum(c.bytes_recv for c in real)
+        if sent is not None:
+            v["net_total_up"], v["net_total_down"] = float(sent), float(recv)
+            if self._net_prev:
+                t0, s0, r0 = self._net_prev
+                dt = max(now - t0, 1e-3)
+                v["net_up"] = max(0.0, (sent - s0) / dt / 1024.0)
+                v["net_down"] = max(0.0, (recv - r0) / dt / 1024.0)
+            self._net_prev = (now, sent, recv)
+        else:
+            v["net_up"] = v["net_down"] = 0.0
+            self._net_prev = None
         return v
 
 

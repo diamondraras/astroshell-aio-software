@@ -30,10 +30,15 @@ def main() -> int:
     sock = QLocalSocket()
     sock.connectToServer(INSTANCE_KEY)
     if sock.waitForConnected(300):
+        # Already running: this app answers "ok" and brings its window to the front.
+        # No answer means the original SmartMonitor28 A3 (same key) holds the display.
         sock.write(b"show")
         sock.flush()
         sock.waitForBytesWritten(300)
-        QMessageBox.warning(None, "Warning", QApplication.translate("QObject", "app is already running."))
+        if not (sock.waitForReadyRead(3000) and sock.readAll().data().startswith(b"ok")):
+            QMessageBox.warning(None, "SmartMonitor",
+                                "Another display app (probably SmartMonitor28 A3) is running.\n"
+                                "Close it first: only one program can drive the display.")
         return 0
     QLocalServer.removeServer(INSTANCE_KEY)
     server = QLocalServer()
@@ -50,9 +55,15 @@ def main() -> int:
 
     apply_language(cfg.get("language/type"))
     win = MainWindow(cfg, apply_language)
-    server.newConnection.connect(lambda: (server.nextPendingConnection(), win.show_normal()))
+
+    def on_second_instance():
+        conn = server.nextPendingConnection()
+        conn.write(b"ok")
+        conn.flush()
+        win.show_normal()
+    server.newConnection.connect(on_second_instance)
     if "--minimized" not in sys.argv:
-        win.show()
+        win.show_normal()  # builds the pages; a minimized (autostart) launch builds them on first open
     rc = app.exec()
     win.shutdown()
     return rc

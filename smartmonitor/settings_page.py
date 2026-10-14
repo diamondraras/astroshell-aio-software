@@ -44,7 +44,7 @@ class SettingsPage(QWidget):
         form.addRow("Temp", self.temp_unit)
 
         self.network = QComboBox()
-        self.network.addItem("All")
+        self.network.addItem("Auto (internet interface)")
         self.network.addItems(sensors.network_interfaces())
         idx = cfg.get("network/type")
         self.network.setCurrentIndex(idx if idx < self.network.count() else 0)

@@ -25,7 +25,32 @@ reverse-engineering evidence gathered with REA/Ghidra from the shipped `SmartMon
 - Settings: language (English, Chinese, French, Japanese, Korean, Portuguese), auto-run at login
   (Windows registry Run key / Linux XDG autostart), °C/°F, network interface, disk, device
   version, firmware upgrade (`.bin`), reboot, export of sensor readings.
-- System tray, single instance, start minimized with `--minimized`.
+- System tray (with a display-mode menu), single instance, start minimized with `--minimized`.
+
+### Additions beyond the original
+- **System dashboard** (default display mode, `smartmonitor/dashboard.py`). It shows:
+  - an analog clock with the digital time, date and computer uptime in hours;
+  - CPU and GPU usage % and temperature in °C, each with a 1-minute graph;
+  - network download/upload speed with a 1-minute graph, data used since boot, and an online
+    indicator that switches to a crossed-globe "No internet" logo when offline.
+  - Online state: a TCP handshake to 1.1.1.1:443, 8.8.8.8:53 or 9.9.9.9:443 every 10 s. No data
+    is sent.
+  - Network interface: the one holding the default route. It is found with a UDP `connect`, which
+    sends no packet.
+- **Display modes:** Dashboard, Theme or Screen mirror. Switch from the Home page or the tray menu.
+- **Per-widget rotation** in the editor: −180…180° from the property panel, ±90° from the toolbar
+  or with Ctrl+L / Ctrl+R. Rotations are stored in `extra.json` next to the `.theme` file, so the
+  `.theme` stays byte-identical and still opens in the original app (unrotated).
+- **Editor shortcuts:** Ctrl+S, Ctrl+Shift+S, Ctrl+N, Ctrl+O, Del, arrows (Shift = 10 px).
+- **Lower resource use:**
+  - Frames are re-rendered only when their content changes.
+  - Static content is sent to the display at a 2 fps keep-alive.
+  - The full 25 fps is used only for video/GIF themes and screen mirroring.
+  - Pages are built on first use, and a `--minimized` autostart builds no UI at all.
+  - Heavy imports (PyAV, numpy) are preloaded in the background.
+- **CPU temperature on Windows** has no unprivileged source. The app reads it from HWiNFO
+  (Settings → Shared Memory Support) or from LibreHardwareMonitor (Options → Remote Web Server,
+  port 8085), whichever is running.
 
 ## Run from source
 
@@ -57,7 +82,7 @@ PyInstaller does not cross-compile: build on the OS you target.
 
 ## Tests
 ```sh
-python -m pytest -q tests      # 49 tests: protocol packets, reply handling, 39 stock-theme round-trips
+python -m pytest -q tests      # 61 tests: protocol, replies, 39 theme round-trips, dashboard, rotation
 python smartmonitor/theme_format.py verify themes   # parse + re-serialize every stock theme
 ```
 

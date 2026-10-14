@@ -9,7 +9,6 @@ import threading
 import time
 from pathlib import Path
 
-import av  # imported eagerly: first import is slow and would delay the first frame
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage
 
@@ -31,6 +30,7 @@ class MediaSource:
         self._stop = threading.Event()
         self._thread = None
         ext = self.path.suffix.lower()
+        self.animated = ext in ANIM_EXT
         if not self.path.exists():
             log.warning("file %s not found", self.path)
         elif ext in ANIM_EXT:
@@ -54,6 +54,7 @@ class MediaSource:
         self._stop.set()
 
     def _decode_loop(self):
+        import av  # slow first import; app.py pre-imports it on a background thread at startup
         while not self._stop.is_set():
             try:
                 with av.open(str(self.path)) as container:

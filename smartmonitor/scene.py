@@ -7,6 +7,7 @@ like the original, so layout matches.
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import math
 import shutil
@@ -39,6 +40,10 @@ SENSOR_RANGES = {1: (0, 10000), 2: (0, 120), 3: (0, 100), 4: (0, 10000), 5: (0, 
 
 TIME_FORMATS = {"24H": "hh:mm:ss", "12H": "hh:mm:ss ap"}
 DATE_FORMATS = {"Y/M/D": "yyyy/MM/dd", "M/D": "MM/dd", "D/M/Y": "dd/MM/yyyy", "D/M": "dd/MM"}
+
+# Per-widget rotation is an addition of this rebuild. It is stored next to the .theme file so the
+# .theme itself stays byte-compatible with the original app (which simply ignores the extra file).
+EXTRA_FILE = "extra.json"
 
 
 # --------------------------------------------------------------------------- conversions
@@ -101,11 +106,23 @@ def _qt6_weight_to_qt5(w6) -> int:
 
 # --------------------------------------------------------------------------- items
 class EditableMixin:
-    """Common editor behaviour (select / move)."""
+    """Common editor behaviour (select / move / rotate)."""
+
+    angle = 0.0  # degrees, clockwise, around the item's centre
 
     def set_editable(self, on: bool):
         self.setFlag(QGraphicsItem.ItemIsMovable, on)
         self.setFlag(QGraphicsItem.ItemIsSelectable, on)
+
+    def set_angle(self, deg: float):
+        deg = ((float(deg) + 180.0) % 360.0) - 180.0
+        self.angle = 0.0 if abs(deg) < 1e-6 else deg
+        self.sync_rotation()
+
+    def sync_rotation(self):
+        if self.angle or self.rotation():
+            self.setTransformOriginPoint(self.boundingRect().center())
+            self.setRotation(self.angle)
 
 
 class LabelItem(EditableMixin, QGraphicsTextItem):
@@ -132,6 +149,8 @@ class LabelItem(EditableMixin, QGraphicsTextItem):
     def set_text(self, text: str):
         if self.toPlainText() != text:
             self.setPlainText(text)
+            if self.angle:
+                self.sync_rotation()
 
 
 class NumberItem(LabelItem):
@@ -148,6 +167,15 @@ class NumberItem(LabelItem):
 
     def children_items(self):
         return [i for i in (self.unit_item, self.name_item) if i is not None]
+
+    def sync_rotation(self):
+        """Value, unit and name rotate together around the value's centre."""
+        super().sync_rotation()
+        pivot = self.pos() + self.boundingRect().center()
+        for c in self.children_items():
+            if self.angle or c.rotation():
+                c.setTransformOriginPoint(pivot - c.pos())
+                c.setRotation(self.angle)
 
     def to_record(self):
         r = super().to_record()
@@ -175,6 +203,7 @@ class RectItem(EditableMixin, QGraphicsObject):
     def resize(self, w: float, h: float):
         self.prepareGeometryChange()
         self.w, self.h = w, h
+        self.sync_rotation()
 
     def to_record(self):
         self.record.rect = (self.pos().x(), self.pos().y(), self.w, self.h)
@@ -195,6 +224,10 @@ class ImageItem(RectItem):
         self.res_dir = res_dir
         self.source: MediaSource | None = None
         self.load()
+
+    @property
+    def animated(self) -> bool:
+        return bool(self.source and self.source.animated)
 
     def load(self):
         if self.source:
@@ -443,7 +476,37 @@ class ThemeScene(QGraphicsScene):
         parsed = tf.parse_file(theme_file)
         for rec in parsed["records"]:
             self.add_record(rec)
+        self._load_extra()
         self._apply_background()
+
+    def _load_extra(self):
+        f = self.theme_dir / EXTRA_FILE if self.theme_dir else None
+        if not f or not f.exists():
+            return
+        try:
+            angles = json.loads(f.read_text(encoding="utf-8")).get("rotation", {})
+        except Exception as e:
+            log.warning("ignoring %s: %s", f, e)
+            return
+        for it in self.widgets:
+            if it.objectName() in angles:
+                it.set_angle(angles[it.objectName()])
+
+    def extra(self) -> dict:
+        return {"rotation": {w.objectName(): round(w.angle, 2) for w in self.widgets if w.angle}}
+
+    @property
+    def animated(self) -> bool:
+        """True when the theme needs full frame rate (video/GIF or screen capture)."""
+        return any(isinstance(w, ScreenCaptureItem) or (isinstance(w, ImageItem) and w.animated)
+                   for w in self.widgets)
+
+    def unique_name(self, prefix: str) -> str:
+        names = {w.objectName() for w in self.widgets}
+        n = 1
+        while f"{prefix}_{n}" in names:
+            n += 1
+        return f"{prefix}_{n}"
 
     def add_record(self, rec):
         if isinstance(rec, tf.SceneSettings):
@@ -510,6 +573,11 @@ class ThemeScene(QGraphicsScene):
             shutil.copytree(self.res_dir, theme_dir / "res", dirs_exist_ok=True)
         name = theme_dir.name.removeprefix("theme_")
         tf.write_file(theme_dir / f"{name}.theme", self.to_theme())
+        extra, extra_file = self.extra(), theme_dir / EXTRA_FILE
+        if extra["rotation"]:
+            extra_file.write_text(json.dumps(extra, indent=1), encoding="utf-8")
+        elif extra_file.exists():
+            extra_file.unlink()
         self.theme_dir = theme_dir
 
     def import_resource(self, path: str | Path) -> str:

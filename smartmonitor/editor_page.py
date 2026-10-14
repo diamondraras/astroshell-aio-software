@@ -1,14 +1,13 @@
 """Theme editor (original: DispThemePage + DispSceneView + per-widget attribute panels)."""
 from __future__ import annotations
 
-import itertools
 from pathlib import Path
 
 from PySide6.QtCore import QCoreApplication, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QPainter
+from PySide6.QtGui import QColor, QKeySequence, QPainter, QShortcut
 from PySide6.QtWidgets import (QColorDialog, QComboBox, QDoubleSpinBox, QFileDialog, QFontDialog, QFormLayout,
                                QGraphicsView, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-                               QMessageBox, QPushButton, QScrollArea, QToolButton, QVBoxLayout, QWidget)
+                               QMessageBox, QPushButton, QScrollArea, QSlider, QToolButton, QVBoxLayout, QWidget)
 
 from . import theme_format as tf
 from .config import themes_dir
@@ -37,7 +36,6 @@ class EditorPage(QWidget):
         self.scene.clear_theme()
         self.scene.selectionChanged.connect(self._on_selection)
         self._saved = self._snapshot()
-        self._ids = itertools.count(1)
 
         root = QVBoxLayout(self)
         bar = QHBoxLayout()
@@ -47,9 +45,13 @@ class EditorPage(QWidget):
             b.clicked.connect(slot)
             bar.addWidget(b)
         bar.addSpacing(20)
-        for text, slot in (("▲", self._raise), ("▼", self._lower), (tr("Cut"), self._delete)):
+        for text, slot, tip in (("▲", self._raise, "Bring forward"), ("▼", self._lower, "Send backward"),
+                                ("⟲ 90°", lambda: self._rotate_by(-90), "Rotate left  [Ctrl+L]"),
+                                ("⟳ 90°", lambda: self._rotate_by(90), "Rotate right  [Ctrl+R]"),
+                                (tr("Cut"), self._delete, "Delete the selected widget  [Del]")):
             b = QToolButton()
             b.setText(text)
+            b.setToolTip(tip)
             b.clicked.connect(slot)
             bar.addWidget(b)
         bar.addStretch(1)
@@ -82,12 +84,35 @@ class EditorPage(QWidget):
         root.addLayout(body, 1)
 
         self._timer = QTimer(self, interval=200, timeout=self._refresh)
-        self._timer.start()
         self._on_selection()
+        self._shortcuts()
+
+    def _shortcuts(self):
+        page = Qt.WidgetWithChildrenShortcut
+        for seq, slot in ((QKeySequence.Save, self.save_theme), (QKeySequence("Ctrl+Shift+S"), self.save_theme_as),
+                          (QKeySequence.New, self.new_theme), (QKeySequence.Open, self.open_theme),
+                          (QKeySequence("Ctrl+R"), lambda: self._rotate_by(90)),
+                          (QKeySequence("Ctrl+L"), lambda: self._rotate_by(-90))):
+            QShortcut(seq, self, activated=slot, context=page)
+        # keys that would clash with the property editors only act on the canvas
+        QShortcut(QKeySequence.Delete, self.view, activated=self._delete, context=Qt.WidgetShortcut)
+        for key, dx, dy in ((Qt.Key_Left, -1, 0), (Qt.Key_Right, 1, 0), (Qt.Key_Up, 0, -1), (Qt.Key_Down, 0, 1)):
+            QShortcut(QKeySequence(key), self.view, activated=lambda dx=dx, dy=dy: self._nudge(dx, dy),
+                      context=Qt.WidgetShortcut)
+            QShortcut(QKeySequence(Qt.SHIFT | key), self.view,
+                      activated=lambda dx=dx, dy=dy: self._nudge(dx * 10, dy * 10), context=Qt.WidgetShortcut)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._timer.start()
+
+    def hideEvent(self, e):
+        super().hideEvent(e)
+        self._timer.stop()
 
     # ------------------------------------------------------------------ file ops
     def _snapshot(self) -> bytes:
-        return tf.serialize(self.scene.to_theme())
+        return tf.serialize(self.scene.to_theme()) + repr(self.scene.extra()).encode()
 
     @property
     def dirty(self) -> bool:
@@ -137,8 +162,17 @@ class EditorPage(QWidget):
             return self.save_theme_as()
         self.scene.save()
         self.dirty = False
-        self.theme_saved.emit()
+        self._saved_notify()
         return True
+
+    def _saved_notify(self):
+        """Refresh the theme library, and the display when the saved theme is the one shown."""
+        self.theme_saved.emit()
+        r = self.main.renderer
+        if r.theme_name and self.scene.theme_dir and \
+                r.theme_path(r.theme_name).resolve() == self.scene.theme_dir.resolve():
+            r.reload()
+            self.main.invalidate()
 
     def save_theme_as(self) -> bool:
         name, ok = QInputDialog.getText(self, tr("Save As File"), "name:")
@@ -152,23 +186,24 @@ class EditorPage(QWidget):
         self.scene.save(target)
         self.title.setText(target.name)
         self.dirty = False
-        self.theme_saved.emit()
+        self._saved_notify()
         return True
 
     # ------------------------------------------------------------------ widgets
     def add_widget(self, kind: str):
-        n = next(self._ids)
+        u = self.scene.unique_name
         mid = (110.0, 140.0)
         if kind == "text":
-            rec = _label_record(tf.TextWidget, f"text_{n}", mid, "input text here!", 16, False)
+            rec = _label_record(tf.TextWidget, u("text"), mid, "input text here!", 16, False)
         elif kind in ("date", "time", "weekday"):
             cls = {"date": tf.DateWidget, "time": tf.TimeWidget, "weekday": tf.WeekdayWidget}[kind]
-            rec = _label_record(cls, f"{kind}_{n}_datetime", mid, "", 20)
+            rec = _label_record(cls, u(kind) + "_datetime", mid, "", 20)
         elif kind == "number":
-            rec = _label_record(tf.NumberWidget, f"data_{n}", mid, "00", 24)
+            name = u("data")
+            rec = _label_record(tf.NumberWidget, name, mid, "00", 24)
             rec.sensor = 3
-            rec.unit = _label_record(tf.LabelItem, f"data_{n}_unit", (mid[0] + 40, mid[1] + 6), "%", 12)
-            rec.label = _label_record(tf.LabelItem, f"data_{n}_name", (mid[0] - 10, mid[1] - 28), "CPU Usage", 12)
+            rec.unit = _label_record(tf.LabelItem, f"{name}_unit", (mid[0] + 40, mid[1] + 6), "%", 12)
+            rec.label = _label_record(tf.LabelItem, f"{name}_name", (mid[0] - 10, mid[1] - 28), "CPU Usage", 12)
         elif kind == "image":
             p, _ = QFileDialog.getOpenFileName(self, "Open Image", "", FILE_FILTER)
             if not p:
@@ -176,15 +211,15 @@ class EditorPage(QWidget):
             if self.scene.theme_dir is None and not self.save_theme_as():
                 return
             rel = self.scene.import_resource(p)
-            rec = tf.ImageWidget(f"image_{n}", (0.0, 0.0, 320.0, 320.0), rel)
+            rec = tf.ImageWidget(u("image"), (0.0, 0.0, 320.0, 320.0), rel)
         elif kind == "bar":
-            rec = tf.ProgressBarWidget(f"progress_bar_{n}", (60.0, 150.0, 200.0, 20.0), 3)
+            rec = tf.ProgressBarWidget(u("progress_bar"), (60.0, 150.0, 200.0, 20.0), 3)
         elif kind == "arc":
-            rec = tf.ArcWidget(f"arc_{n}", (110.0, 110.0, 100.0, 100.0), 3)
+            rec = tf.ArcWidget(u("arc"), (110.0, 110.0, 100.0, 100.0), 3)
         elif kind == "gauge":
-            rec = tf.GaugeWidget(f"gauge_{n}", (110.0, 110.0, 100.0, 100.0), 3)
+            rec = tf.GaugeWidget(u("gauge"), (110.0, 110.0, 100.0, 100.0), 3)
         elif kind == "clock":
-            rec = tf.AnalogClockWidget(f"clock_{n}", (85.0, 85.0, 150.0, 150.0))
+            rec = tf.AnalogClockWidget(u("clock"), (85.0, 85.0, 150.0, 150.0))
         else:
             return
         item = self.scene.add_record(rec)
@@ -232,9 +267,22 @@ class EditorPage(QWidget):
         if it is not None and it in self.scene.widgets:
             self.scene.remove_widget(it)
 
+    def _nudge(self, dx: int, dy: int):
+        for it in self.scene.selectedItems():
+            it.moveBy(dx, dy)
+        self._on_selection()
+
+    def _rotate_by(self, delta: float):
+        it = self._selected()
+        if it is not None and it in self.scene.widgets:
+            it.set_angle(it.angle + delta)
+            self._on_selection()
+
     def _refresh(self):
-        if self.isVisible():
-            self.scene.update_values(self.sensors.snapshot(), fahrenheit=self.cfg.get("temp/uint") == 1)
+        self.scene.update_values(self.sensors.snapshot(), fahrenheit=self.cfg.get("temp/uint") == 1)
+        for w in self.scene.widgets:
+            if w.angle:
+                w.sync_rotation()  # keeps number labels rotating around the value after drags
 
     # ------------------------------------------------------------------ property panel
     def _on_selection(self):
@@ -262,6 +310,32 @@ class EditorPage(QWidget):
         if isinstance(it, RectItem):
             form.addRow("w:", spin(it.w, lambda v: (it.resize(v, it.h), self._reload_media(it)), 1))
             form.addRow("h:", spin(it.h, lambda v: (it.resize(it.w, v), self._reload_media(it)), 1))
+
+        owner = self._selected()
+        if owner in self.scene.widgets:
+            row = QHBoxLayout()
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(-180, 180)
+            slider.setValue(round(owner.angle))
+            box = QDoubleSpinBox()
+            box.setRange(-180, 180)
+            box.setDecimals(0)
+            box.setSuffix("°")
+            box.setWrapping(True)
+            box.setValue(owner.angle)
+
+            def set_angle(v, src):
+                owner.set_angle(v)
+                for w in (slider, box):
+                    if w is not src:
+                        w.blockSignals(True)
+                        w.setValue(round(owner.angle))
+                        w.blockSignals(False)
+            slider.valueChanged.connect(lambda v: set_angle(v, slider))
+            box.valueChanged.connect(lambda v: set_angle(v, box))
+            row.addWidget(slider, 1)
+            row.addWidget(box)
+            form.addRow("rotation:", row)
 
         if isinstance(it, LabelItem):
             if it.kind in (2, -1, -2):
