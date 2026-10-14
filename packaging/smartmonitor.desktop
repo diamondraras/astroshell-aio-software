@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=SmartMonitor
+Comment=Drive the SmartMonitor USB display
+Exec=smartmonitor
+Icon=smartmonitor
+Categories=Utility;System;Monitor;

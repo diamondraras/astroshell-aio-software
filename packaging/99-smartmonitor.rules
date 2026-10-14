@@ -1,0 +1,2 @@
+# SmartMonitor 2.8" display (USB 1f3a:0007) - allow non-root access via libusb
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1f3a", ATTRS{idProduct}=="0007", MODE="0666", TAG+="uaccess"
