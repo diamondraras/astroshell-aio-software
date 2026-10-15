@@ -22,8 +22,8 @@ reverse-engineering evidence gathered with REA/Ghidra from the shipped `SmartMon
 - Theme editor: Text, Number (sensor), Image/GIF/Video, progress Bar, Arc, Gauge, analog Clock,
   Date, Time, Weekday. Move with the mouse, edit position/size/colour/font/sensor, raise/lower,
   delete, Save / Save As. Saved themes open in the original app as well.
-- Settings: language (English, Chinese, French, Japanese, Korean, Portuguese), auto-run at login
-  (Windows registry Run key / Linux XDG autostart), °C/°F, network interface, disk, device
+- Settings: language (English, Chinese, French, Japanese, Korean, Portuguese), auto-run (Windows registry Run key; Linux systemd user service, started at boot when lingering is
+  enabled: `loginctl enable-linger $USER`), °C/°F, network interface, disk, device
   version, firmware upgrade (`.bin`), reboot, export of sensor readings.
 - System tray (with a display-mode menu), single instance, start minimized with `--minimized`.
 
@@ -33,6 +33,8 @@ reverse-engineering evidence gathered with REA/Ghidra from the shipped `SmartMon
   - CPU and GPU usage % and temperature in °C, each with a 1-minute graph;
   - network download/upload speed with a 1-minute graph, data used since boot, and an online
     indicator that switches to a crossed-globe "No internet" logo when offline.
+  - disk space as a pie chart (used / free, percentage in the centre; amber, orange above 75 %, red above
+    90 %) for the disk chosen in Settings (default `/`);
   - Online state: a TCP handshake to 1.1.1.1:443, 8.8.8.8:53 or 9.9.9.9:443 every 10 s. No data
     is sent.
   - Network interface: the one holding the default route. It is found with a UDP `connect`, which

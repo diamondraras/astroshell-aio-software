@@ -386,7 +386,9 @@ class SensorManager:
         v["mem_usage"] = psutil.virtual_memory().percent
         try:
             mount = self._disk or ("C:\\" if sys.platform == "win32" else "/")
-            v["disk_usage"] = psutil.disk_usage(mount).percent
+            du = psutil.disk_usage(mount)
+            v["disk_usage"] = du.percent
+            v["disk_used"], v["disk_total"] = float(du.used), float(du.total)
         except Exception:
             pass
 

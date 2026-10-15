@@ -3,7 +3,7 @@
 Layout:
   header   analog clock | time, date, uptime
   cards    CPU and GPU: usage %, temperature °C, 1-minute graph of both
-  network  download / upload speed, data used since boot, 1-minute graph, online state
+  bottom   network (speed, data used since boot, 1-minute graph, online state) | disk space pie chart
 
 Rendering cost is kept low: the static layer (background, card frames, titles) is drawn once,
 and the dynamic layer is redrawn only when the second changes or new sensor data arrives.
@@ -26,6 +26,7 @@ TEMP_C, HOT_C = QColor("#fb923c"), QColor("#ef4444")
 DOWN_C, UP_C = QColor("#34d399"), QColor("#f472b6")
 OK_C, BAD_C = QColor("#22c55e"), QColor("#ef4444")
 SECOND_HAND = QColor("#ff5a5f")
+DISK_C, DISK_WARN = QColor("#fbbf24"), QColor("#fb923c")
 
 FONT_FAMILIES = ["Segoe UI", "Inter", "Noto Sans", "DejaVu Sans", "Arial"]
 
@@ -94,15 +95,16 @@ class DashboardRenderer:
         self.f_big = _font(30, QFont.Bold)
         self.f_unit = _font(14, QFont.DemiBold)
         self.f_temp = _font(16, QFont.Bold)
-        self.f_rate = _font(19, QFont.Bold)
-        self.f_rate_unit = _font(11, QFont.DemiBold)
+        self.f_rate_s = _font(16, QFont.Bold)
         self.f_total = _font(15, QFont.Bold)
+        self.f_pct = _font(15, QFont.Bold)
 
     # geometry ------------------------------------------------------------------------------
     CLOCK_C, CLOCK_R = QPointF(50, 52), 43.0
-    CPU_RECT = QRectF(6, 104, 151, 100)
-    GPU_RECT = QRectF(163, 104, 151, 100)
-    NET_RECT = QRectF(6, 210, 308, 104)
+    CPU_RECT = QRectF(6, 104, 151, 92)
+    GPU_RECT = QRectF(163, 104, 151, 92)
+    NET_RECT = QRectF(6, 202, 198, 112)
+    DISK_RECT = QRectF(210, 202, 104, 112)
 
     # public API --------------------------------------------------------------------------
     def render(self) -> QImage:
@@ -129,13 +131,13 @@ class DashboardRenderer:
         g.setColorAt(0, BG_TOP)
         g.setColorAt(1, BG_BOTTOM)
         p.fillRect(0, 0, self.w, self.h, g)
-        for r in (self.CPU_RECT, self.GPU_RECT, self.NET_RECT):
+        for r in (self.CPU_RECT, self.GPU_RECT, self.NET_RECT, self.DISK_RECT):
             p.setPen(QPen(CARD_EDGE, 1))
             p.setBrush(CARD)
             p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), 10, 10)
         p.setFont(self.f_title)
         for r, name, c in ((self.CPU_RECT, "CPU", CPU_C), (self.GPU_RECT, "GPU", GPU_C),
-                           (self.NET_RECT, "NETWORK", DOWN_C)):
+                           (self.NET_RECT, "NETWORK", DOWN_C), (self.DISK_RECT, "DISK", DISK_C)):
             p.setPen(c)
             p.drawText(QPointF(r.x() + 10, r.y() + 18), name)
         # clock face
@@ -176,6 +178,7 @@ class DashboardRenderer:
         self._draw_chip(p, self.GPU_RECT, GPU_C, vals.get("gpu_usage"), vals.get("gpu_temp"),
                         self.sensors.history("gpu_usage"), self.sensors.history("gpu_temp"), fahrenheit)
         self._draw_net(p, vals)
+        self._draw_disk(p, vals)
         p.end()
         return img
 
@@ -335,28 +338,22 @@ class DashboardRenderer:
         x = r.x() + 10
         for arrow, key, color in (("↓", "net_down", DOWN_C), ("↑", "net_up", UP_C)):
             num, unit = fmt_rate(vals.get(key))
-            p.setFont(self.f_rate)
+            p.setFont(self.f_rate_s)
             p.setPen(color if not offline else DIM)
-            p.drawText(QPointF(x, r.y() + 44), f"{arrow} {num}")
-            nw = QFontMetricsF(self.f_rate).horizontalAdvance(f"{arrow} {num}")
-            p.setFont(self.f_rate_unit)
+            p.drawText(QPointF(x, r.y() + 42), f"{arrow} {num}")
+            nw = QFontMetricsF(self.f_rate_s).horizontalAdvance(f"{arrow} {num}")
+            p.setFont(self.f_tiny)
             p.setPen(MUTED)
-            p.drawText(QPointF(x + nw + 3, r.y() + 44), unit)
-            x += 104
+            p.drawText(QPointF(x + nw + 2, r.y() + 42), unit)
+            x += 92
         # total since boot
         down, up = vals.get("net_total_down"), vals.get("net_total_up")
         total = None if down is None else down + (up or 0)
-        ttext = fmt_bytes(total)
-        p.setFont(self.f_total)
-        tw = QFontMetricsF(self.f_total).horizontalAdvance(ttext)
-        p.setPen(TEXT if total is not None else DIM)
-        p.drawText(QPointF(r.right() - 10 - tw, r.y() + 40), ttext)
         p.setFont(self.f_tiny)
-        lw = QFontMetricsF(self.f_tiny).horizontalAdvance("used since boot")
         p.setPen(MUTED)
-        p.drawText(QPointF(r.right() - 10 - lw, r.y() + 51), "used since boot")
+        p.drawText(QPointF(r.x() + 10, r.y() + 56), f"{fmt_bytes(total)} used since boot")
         # graph
-        g = QRectF(r.x() + 8, r.y() + 57, r.width() - 16, r.height() - 63)
+        g = QRectF(r.x() + 8, r.y() + 62, r.width() - 16, r.height() - 68)
         h_down, h_up = self.sensors.history("net_down"), self.sensors.history("net_up")
         peak = max([v for v in h_down + h_up if v is not None] or [0.0])
         peak = max(peak, 100.0)
@@ -371,10 +368,44 @@ class DashboardRenderer:
         if offline:
             p.fillRect(g, QColor(4, 6, 10, 170))
             c = g.center()
-            self._globe_icon(p, QPointF(c.x() - 42, c.y()), 13, BAD_C, crossed=True)
-            p.setFont(self.f_total)
+            self._globe_icon(p, QPointF(c.x() - 46, c.y()), 9, BAD_C, crossed=True)
+            p.setFont(self.f_small)
             p.setPen(BAD_C)
-            p.drawText(QPointF(c.x() - 22, c.y() + 6), "No internet")
+            p.drawText(QPointF(c.x() - 32, c.y() + 4), "No internet")
+
+    def _draw_disk(self, p: QPainter, vals: dict):
+        r = self.DISK_RECT
+        used, total, pct = vals.get("disk_used"), vals.get("disk_total"), vals.get("disk_usage")
+        known = used is not None and total
+        frac = min(1.0, max(0.0, used / total)) if known else 0.0
+        color = HOT_C if frac >= 0.9 else DISK_WARN if frac >= 0.75 else DISK_C
+        c, rad = QPointF(r.center().x(), r.y() + 56), 31.0
+        box = QRectF(c.x() - rad, c.y() - rad, 2 * rad, 2 * rad)
+        # pie: free space is the dark slice, used space starts at 12 o'clock and runs clockwise
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#1f2937"))
+        p.drawEllipse(box)
+        if frac > 0:
+            p.setBrush(color)
+            if frac >= 0.999:
+                p.drawEllipse(box)
+            else:
+                p.drawPie(box, 90 * 16, int(-frac * 360 * 16))
+        p.setBrush(CARD)
+        p.drawEllipse(c, rad * 0.58, rad * 0.58)
+        p.setFont(self.f_pct)
+        p.setPen(TEXT if known else DIM)
+        label = f"{frac * 100:.0f}%" if known else "--"
+        p.drawText(QRectF(c.x() - 20, c.y() - 10, 40, 20), Qt.AlignCenter, label)
+        # numbers
+        p.setFont(self.f_tiny)
+        p.setPen(color if known else DIM)
+        p.drawText(QRectF(r.x(), r.y() + 90, r.width(), 10), Qt.AlignCenter,
+                   f"{fmt_bytes(used)} used")
+        p.setPen(MUTED)
+        free = total - used if known else None
+        p.drawText(QRectF(r.x(), r.y() + 100, r.width(), 10), Qt.AlignCenter,
+                   f"{fmt_bytes(free)} free" if known else "--")
 
     @staticmethod
     def _globe_icon(p: QPainter, c: QPointF, r: float, color: QColor, crossed: bool):

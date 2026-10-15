@@ -116,14 +116,35 @@ def set_autorun(enabled: bool) -> None:
         else:
             s.remove("SmartMonitor")
         return
-    autostart = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "autostart"
-    desktop = autostart / "smartmonitor.desktop"
+    cfg_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    desktop = cfg_home / "autostart" / "smartmonitor.desktop"
+    unit = cfg_home / "systemd" / "user" / "smartmonitor.service"
+    cmd = f"{exe} --minimized" if getattr(sys, "frozen", False) else exe
     if enabled:
-        autostart.mkdir(parents=True, exist_ok=True)
-        cmd = f"{exe} --minimized" if getattr(sys, "frozen", False) else exe
-        desktop.write_text(
-            "[Desktop Entry]\nType=Application\nName=SmartMonitor\n"
-            f"Exec={cmd}\nPath={app_dir()}\nX-GNOME-Autostart-enabled=true\n"
-        )
-    elif desktop.exists():
-        desktop.unlink()
+        # systemd user service: starts at boot (with `loginctl enable-linger`) or at login, restarts on
+        # failure. Without a display server it falls back to the offscreen Qt platform, so the USB
+        # display works on a headless host. The XDG autostart entry is removed to avoid a second instance.
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        unit.write_text(
+            "[Unit]\nDescription=SmartMonitor USB display\nAfter=graphical-session.target\n\n"
+            "[Service]\nType=simple\nWorkingDirectory=%s\n"
+            "ExecStart=/bin/sh -c 'if [ -z \"$DISPLAY$WAYLAND_DISPLAY\" ]; then export QT_QPA_PLATFORM=offscreen; fi; exec %s'\n"
+            "Restart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n" % (app_dir(), cmd))
+        if desktop.exists():
+            desktop.unlink()
+        _systemctl("daemon-reload")
+        _systemctl("enable", "smartmonitor.service")
+    else:
+        _systemctl("disable", "smartmonitor.service")
+        for f in (unit, desktop):
+            if f.exists():
+                f.unlink()
+        _systemctl("daemon-reload")
+
+
+def _systemctl(*args: str) -> None:
+    import subprocess
+    try:
+        subprocess.run(["systemctl", "--user", *args], check=False, timeout=15, capture_output=True)
+    except (OSError, subprocess.SubprocessError):
+        pass
